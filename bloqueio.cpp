@@ -1,79 +1,113 @@
-﻿#include <iostream>      // Biblioteca padrão para entrada e saída (cout, cin)
-#include <windows.h>     // Biblioteca principal do Windows (para funções do sistema)
-#include <tlhelp32.h>    // Necessária para manipular e listar processos
-#include <vector>        // Para armazenar a lista de programas bloqueados
-#include <string>        // Para trabalhar com strings (nomes dos processos)
+﻿// identifica_origem_delete.cpp
+#include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iomanip>
 
 using namespace std;
 
-// 🚫 Lista de programas proibidos
-vector<string> programasBloqueados = {
-    "notepad.exe",     // Exemplo: Bloco de notas
-    "roblox.exe",      // Roblox
-    "discord.exe",     // Discord
-    "minecraft.exe"    // Minecraft
-};
+string WideToString(const wstring& w) {
+    if (w.empty()) return string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    string s(size_needed, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], size_needed, nullptr, nullptr);
+    return s;
+}
 
-// 🔍 Função que verifica todos os processos em execução e encerra os que estão bloqueados
-void verificarEBloquear()
-{
-    // Cria um snapshot (uma "foto") de todos os processos rodando no sistema
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-
-    if (snapshot == INVALID_HANDLE_VALUE)
-    {
-        cout << "❌ Erro ao criar snapshot dos processos." << endl;
-        return;
+// Obtém caminho completo do processo por PID
+bool GetProcessImagePath(DWORD pid, string &outPath) {
+    outPath.clear();
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    WCHAR buf[MAX_PATH];
+    DWORD size = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, buf, &size)) {
+        outPath = WideToString(wstring(buf, buf + size));
+        CloseHandle(h);
+        return true;
     }
+    CloseHandle(h);
+    return false;
+}
 
-    PROCESSENTRY32 processo;       // Estrutura que armazena informações sobre cada processo
-    processo.dwSize = sizeof(PROCESSENTRY32);
+// Encerra o processo
+bool TerminateProcessByPID(DWORD pid) {
+    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (!hProc) return false;
+    bool result = TerminateProcess(hProc, 0) != 0;
+    CloseHandle(hProc);
+    return result;
+}
 
-    // Inicia a listagem dos processos
-    if (Process32First(snapshot, &processo))
-    {
-        do
-        {
-            // Converte o nome do processo de WCHAR para string normal
-            wstring nomeW(processo.szExeFile);
-            string nome(nomeW.begin(), nomeW.end());
+// Tenta apagar o arquivo (.exe)
+bool DeleteExecutable(const string& path) {
+    // Remove atributos somente leitura
+    SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileA(path.c_str())) {
+        cout << "  Arquivo excluido com sucesso: " << path << "\n";
+        return true;
+    } else {
+        cout << "  Falha ao excluir arquivo: " << path << " | Erro: " << GetLastError() << "\n";
+        return false;
+    }
+}
 
-            // Percorre a lista de bloqueados
-            for (string bloqueado : programasBloqueados)
-            {
-                // Compara ignorando maiúsculas/minúsculas
-                if (_stricmp(nome.c_str(), bloqueado.c_str()) == 0)
-                {
-                    // Tenta abrir o processo com permissão para encerrá-lo
-                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, processo.th32ProcessID);
-                    if (hProcess)
-                    {
-                        TerminateProcess(hProcess, 0); // Encerra o processo
-                        CloseHandle(hProcess);
+// Função principal: verifica processos e tenta encerrar/apagar
+void verificarEBloquear() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
 
-                        cout << " Programa bloqueado e encerrado: " << nome << endl;
+    PROCESSENTRY32W processo;
+    processo.dwSize = sizeof(PROCESSENTRY32W);
+
+    vector<string> programasBloqueados = {
+        "notepad.exe",
+        "roblox.exe",
+        "discord.exe",
+        "minecraft.exe"
+    };
+
+    if (Process32FirstW(snapshot, &processo)) {
+        do {
+            string nome = WideToString(wstring(processo.szExeFile));
+            for (const string& bloqueado : programasBloqueados) {
+                if (_stricmp(nome.c_str(), bloqueado.c_str()) == 0) {
+                    DWORD pid = processo.th32ProcessID;
+                    cout << "==> Detectado: " << nome << " (PID=" << pid << ")\n";
+
+                    string caminhoExe;
+                    if (GetProcessImagePath(pid, caminhoExe)) {
+                        cout << "  Caminho do exe: " << caminhoExe << "\n";
+
+                        // 1) tenta encerrar o processo
+                        if (TerminateProcessByPID(pid)) {
+                            cout << "  Processo encerrado com sucesso.\n";
+                            // 2) tenta apagar o executável
+                            DeleteExecutable(caminhoExe);
+                        } else {
+                            cout << "  Falha ao encerrar processo. Arquivo nao sera excluido.\n";
+                        }
+
+                    } else {
+                        cout << "  Nao foi possivel obter o caminho do exe (permissoes?)\n";
                     }
+                    cout << "-------------------------------------------\n";
                 }
             }
-
-        } while (Process32Next(snapshot, &processo)); // Continua até o fim da lista
+        } while (Process32NextW(snapshot, &processo));
     }
-
-    // Fecha o snapshot para liberar memória
     CloseHandle(snapshot);
 }
 
-void iniciarMonitoramento()
-{
-    cout << " Iniciando o sistema de bloqueio de programas..." << endl;
-    cout << "Monitorando processos proibidos a cada 5 segundos." << endl << endl;
-
-    while (true)
-    {
-        verificarEBloquear(); // Chama a função que verifica os processos
-        Sleep(10000);          // Espera 5 segundos antes de verificar novamente
+int main() {
+    cout << "Monitor iniciando (apagar .exe). Ctrl+C para parar.\n";
+    while (true) {
+        verificarEBloquear();
+        Sleep(10000); // 10s
     }
-
- 
-
+    return 0;
 }
